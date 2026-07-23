@@ -1141,6 +1141,290 @@ def merge_columns_from(
     )
 
 
+_REWRITE_METADATA_COLS = frozenset({"_rowaddr", "_fragid", "_rowid"})
+
+
+def _normalize_rewrite_output(
+    result: "pa.Table | pa.RecordBatch | dict[str, Any]",
+) -> pa.Table:
+    """Coerce a user transform result into a :class:`pyarrow.Table`."""
+    if isinstance(result, pa.Table):
+        return result
+    if isinstance(result, pa.RecordBatch):
+        return pa.Table.from_batches([result])
+    if isinstance(result, dict):
+        return pa.table(result)
+    raise TypeError(
+        "rewrite_columns transform must return a pyarrow.Table, "
+        f"pyarrow.RecordBatch, or dict, got {type(result).__name__}"
+    )
+
+
+def _validate_rewrite_output(
+    out: pa.Table,
+    columns: list[str],
+    target_types: dict[str, "pa.DataType"],
+    expected_rows: int,
+) -> None:
+    """Validate a transform result against the target columns and row count."""
+    produced = set(out.column_names)
+    expected = set(columns)
+    if produced != expected:
+        missing = sorted(expected - produced)
+        extra = sorted(produced - expected)
+        raise ValueError(
+            "rewrite_columns transform must return exactly the rewritten "
+            f"columns {sorted(expected)}. Missing: {missing}; unexpected: {extra}."
+        )
+    if out.num_rows != expected_rows:
+        raise ValueError(
+            "rewrite_columns transform must return the same number of rows it "
+            f"received ({expected_rows}), but returned {out.num_rows}."
+        )
+    for name in columns:
+        got = out.schema.field(name).type
+        want = target_types[name]
+        if got != want:
+            raise ValueError(
+                f"rewrite_columns transform returned column '{name}' with type "
+                f"{got}, but the target Lance field type is {want}. The output "
+                "type must match the existing column exactly."
+            )
+
+
+@ray.remote
+def _rewrite_one_fragment(
+    uri: str,
+    storage_options: Optional[dict[str, str]],
+    read_version: int,
+    namespace_impl: Optional[str],
+    namespace_properties: Optional[dict[str, str]],
+    table_id: Optional[list[str]],
+    frag_id: int,
+    columns: list[str],
+    read_columns: Optional[list[str]],
+    filter: Optional[str],
+    transform: Callable[[pa.Table], "pa.Table | pa.RecordBatch | dict[str, Any]"],
+    batch_size: int,
+) -> tuple[int, bytes, list[int]]:
+    """Rewrite ``columns`` for a single fragment at ``read_version``.
+
+    Scans only the rows matching ``filter`` (all live rows if ``filter`` is
+    ``None``), applies ``transform`` per batch, materializes the result, and
+    joins it back onto the fragment by ``_rowaddr`` via ``update_columns``.
+    Rows not matched by the filter keep their existing values.
+    """
+    ns_kwargs = get_namespace_kwargs(namespace_impl, namespace_properties, table_id)
+    local_ds = LanceDataset(
+        uri=uri,
+        storage_options=storage_options,
+        version=read_version,
+        **ns_kwargs,
+    )
+    fragment = local_ds.get_fragment(frag_id)
+    if fragment is None:
+        raise ValueError(f"Fragment {frag_id} not found in Lance dataset at {uri}")
+
+    target_types = {name: local_ds.schema.field(name).type for name in columns}
+    reader_schema = pa.schema(
+        [pa.field("_rowaddr", pa.uint64())]
+        + [pa.field(name, target_types[name]) for name in columns]
+    )
+
+    # Materialize the transformed (matched-only) rows before calling
+    # update_columns: the join scans the same fragment internally, so a lazy
+    # reader over the fragment would deadlock on a mutable borrow.
+    out_batches: list[pa.RecordBatch] = []
+    for batch in fragment.to_batches(
+        columns=read_columns,
+        filter=filter,
+        with_row_address=True,
+        batch_size=batch_size,
+    ):
+        rowaddr = batch.column("_rowaddr")
+        transform_input = pa.table(
+            {
+                name: batch.column(name)
+                for name in batch.schema.names
+                if name not in _REWRITE_METADATA_COLS
+            }
+        )
+        out = _normalize_rewrite_output(transform(transform_input))
+        _validate_rewrite_output(out, columns, target_types, batch.num_rows)
+        assembled = pa.table(
+            {"_rowaddr": rowaddr, **{name: out.column(name) for name in columns}}
+        )
+        out_batches.extend(assembled.to_batches())
+
+    right = pa.Table.from_batches(out_batches, schema=reader_schema)
+    fragment_meta, fields_modified = fragment.update_columns(
+        right, left_on="_rowaddr", right_on="_rowaddr"
+    )
+    return frag_id, pickle.dumps(fragment_meta), list(fields_modified)
+
+
+def rewrite_columns(
+    uri: Optional[str] = None,
+    *,
+    columns: list[str],
+    transform: Callable[[pa.Table], "pa.Table | pa.RecordBatch | dict[str, Any]"],
+    filter: Optional[str] = None,
+    read_columns: Optional[list[str]] = None,
+    read_version: Optional[int | str] = None,
+    ray_remote_args: Optional[dict[str, Any]] = None,
+    storage_options: Optional[dict[str, Any]] = None,
+    namespace_impl: Optional[str] = None,
+    namespace_properties: Optional[dict[str, str]] = None,
+    table_id: Optional[list[str]] = None,
+    batch_size: int = 1024,
+) -> None:
+    """Rewrite existing columns of a Lance dataset in place via Ray.
+
+    Unlike :func:`add_columns_from` (which *adds* new columns), this overwrites
+    the values of columns that already exist. Each affected fragment is
+    rewritten independently by one Ray task -- the fragment is the unit of
+    parallelism, so there is no shuffle. Within a task the matched rows are
+    transformed and joined back onto the fragment by ``_rowaddr`` using
+    :meth:`lance.fragment.LanceFragment.update_columns`, then the driver
+    commits every rewritten fragment in a single
+    ``LanceOperation.Update(update_mode="rewrite_columns")``.
+
+    Row selection is **row-level**: ``filter`` chooses which rows to recompute.
+    Rows in a fragment that do not match ``filter`` keep their existing values,
+    and fragments with no matching rows are left untouched. Note that the unit
+    of rewrite is still a whole fragment's column file -- a fragment is fully
+    rewritten if any of its rows match, so a highly selective filter spread
+    across many fragments does not save I/O.
+
+    Examples:
+        >>> import lance_ray as lr
+        >>> import pyarrow as pa
+        >>> def double_v(tbl):
+        ...     return {"v": pa.compute.multiply(tbl.column("v"), 2)}
+        >>> lr.rewrite_columns(
+        ...     "/tmp/data/", columns=["v"], transform=double_v, filter="v > 0"
+        ... )
+
+    Args:
+        uri: Path to the target Lance dataset. If omitted, provide
+            ``namespace_impl`` and ``table_id`` to resolve the location.
+        columns: Existing top-level columns to overwrite. Nested paths and
+            metadata columns are not supported.
+        transform: Callable applied to each batch of matched rows. It receives a
+            :class:`pyarrow.Table` containing only ``read_columns`` (metadata
+            columns are excluded) and must return exactly ``columns`` -- as a
+            ``pyarrow.Table``, ``pyarrow.RecordBatch``, or dict -- with the same
+            row count and with types matching the existing columns exactly.
+        filter: SQL predicate selecting the rows to rewrite. Rows that do not
+            match keep their current values. If None, all live rows are
+            rewritten.
+        read_columns: Columns from the dataset to read and pass to ``transform``.
+            If None, all columns are read.
+        read_version: Version (or tag) to read. If None, uses the latest. The
+            resolved version is pinned for every task and the final commit.
+        ray_remote_args: kwargs passed to ``ray.remote`` for the per-fragment
+            tasks.
+        storage_options: Storage options for the dataset.
+        namespace_impl: Namespace implementation type (e.g., "dir", "rest").
+        namespace_properties: Properties for connecting to the namespace.
+        table_id: Table identifier as a list of strings.
+        batch_size: Batch size used when scanning each fragment.
+    """
+    if not columns:
+        raise ValueError("'columns' must be a non-empty list of existing columns.")
+
+    validate_uri_or_namespace(uri, namespace_impl, table_id)
+
+    uri, storage_options = resolve_namespace_table(
+        uri,
+        storage_options,
+        namespace_impl,
+        namespace_properties,
+        table_id,
+    )
+    namespace_kwargs = get_namespace_kwargs(
+        namespace_impl, namespace_properties, table_id
+    )
+
+    lance_ds = LanceDataset(
+        uri=uri,
+        storage_options=storage_options,
+        version=read_version,
+        **namespace_kwargs,
+    )
+    pinned_version = lance_ds.version
+
+    schema_names = set(lance_ds.schema.names)
+    for name in columns:
+        if name in _REWRITE_METADATA_COLS:
+            raise ValueError(f"Cannot rewrite metadata column '{name}'.")
+        if name not in schema_names:
+            raise ValueError(
+                f"Column '{name}' does not exist in the Lance dataset at {uri}. "
+                "Only existing top-level columns can be rewritten."
+            )
+
+    # Select the fragments that have at least one row to rewrite.
+    target_frag_ids: list[int] = []
+    for frag in lance_ds.get_fragments():
+        if filter is None:
+            if frag.metadata.num_rows > 0:
+                target_frag_ids.append(frag.metadata.id)
+        elif frag.count_rows(filter) > 0:
+            target_frag_ids.append(frag.metadata.id)
+
+    if not target_frag_ids:
+        # Nothing matched -- no-op, do not create a new version.
+        return
+
+    remote = _rewrite_one_fragment
+    if ray_remote_args:
+        remote = remote.options(**ray_remote_args)
+
+    results = ray.get(
+        [
+            remote.remote(
+                uri,
+                storage_options,
+                pinned_version,
+                namespace_impl,
+                namespace_properties,
+                table_id,
+                frag_id,
+                columns,
+                read_columns,
+                filter,
+                transform,
+                batch_size,
+            )
+            for frag_id in target_frag_ids
+        ]
+    )
+
+    updated_fragments = []
+    fields_modified: set[int] = set()
+    for _frag_id, meta_bytes, fields in results:
+        updated_fragments.append(pickle.loads(meta_bytes))
+        fields_modified.update(fields)
+
+    op = LanceOperation.Update(
+        removed_fragment_ids=[],
+        updated_fragments=updated_fragments,
+        new_fragments=[],
+        fields_modified=sorted(fields_modified),
+        update_mode="rewrite_columns",
+    )
+    # Commit once against the pinned version. Do NOT retry against a newer
+    # version: that would overwrite concurrent updates with stale snapshot data.
+    LanceDataset.commit(
+        uri,
+        op,
+        read_version=pinned_version,
+        storage_options=storage_options,
+        **namespace_kwargs,
+    )
+
+
 def _validate_write_args(
     uri: Optional[str],
     namespace_impl: Optional[str],
