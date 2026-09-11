@@ -7,7 +7,11 @@ inside Ray worker processes via ``runtime_env.worker_process_setup_hook``.
 from __future__ import annotations
 
 import threading
-from typing import Any, Optional
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:
+    import pyarrow as pa
 
 
 def patch_memory_profiler() -> None:
@@ -133,14 +137,16 @@ def setup_worker() -> None:
 # ---------------------------------------------------------------------------
 
 
-def record_batch(data, schema=None):
+def record_batch(
+    data: Mapping[str, Any], schema: Optional[pa.Schema] = None
+) -> pa.RecordBatch:
     """Build a ``pa.RecordBatch`` from a dict, importable from Ray workers."""
     import pyarrow as pa
 
     return pa.RecordBatch.from_pydict(data, schema=schema)
 
 
-def double_price(batch):
+def double_price(batch: pa.RecordBatch) -> pa.RecordBatch:
     """Double the ``price`` column of a batch."""
     import pyarrow.compute as pc
 
